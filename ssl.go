@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -27,6 +28,7 @@ const (
 	FIXED_USERNAME = "ahmed"
 	FIXED_PASSWORD = "ahmed"
 	SSH_PORT       = "4443"
+	BUFFER_SIZE    = 256 * 1024 // 256 KB
 )
 
 type Server struct {
@@ -37,7 +39,7 @@ type Server struct {
 	stopChan      chan struct{}
 }
 
-// ????? ????? TLS ?????
+// توليد شهادة TLS
 func generateTLSCert() (tls.Certificate, error) {
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -70,7 +72,7 @@ func generateTLSCert() (tls.Certificate, error) {
 	return tls.X509KeyPair(certPEM, keyPEM)
 }
 
-// ????? ???????
+// إنشاء السيرفر
 func newServer() (*Server, error) {
 	server := &Server{stopChan: make(chan struct{})}
 
@@ -101,25 +103,48 @@ func newServer() (*Server, error) {
 	}
 
 	server.tlsConfig = &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
-		CipherSuites: []uint16{
-			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305, // ???? ??? ???? ???????
-			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-		},
-		NextProtos: []string{"ssh"},
+		Certificates:             []tls.Certificate{cert},
+		MinVersion:               tls.VersionTLS13,
+		CipherSuites:             nil, // TLS 1.3 يستخدم suite تلقائي أسرع
+		PreferServerCipherSuites: true,
+		NextProtos:               []string{"ssh"},
 	}
 
 	return server, nil
 }
 
-// ??? ???????? ?? Buffer ???? (4MB)
-func copyBuffer(dst io.Writer, src io.Reader, bufSize int) (int64, error) {
-	buf := make([]byte, 4<<20)
-	return io.CopyBuffer(dst, src, buf)
+// نسخ البيانات باستخدام bufio و بافر 256KB مع تجميع atomic
+func copyBufferOptimized(dst io.Writer, src io.Reader, server *Server) error {
+	buf := make([]byte, BUFFER_SIZE)
+	reader := bufio.NewReader(src)
+	writer := bufio.NewWriter(dst)
+
+	var localBytes int64
+	for {
+		n, err := reader.Read(buf)
+		if n > 0 {
+			written, _ := writer.Write(buf[:n])
+			writer.Flush()
+			localBytes += int64(written)
+			if localBytes > 1024*1024 { // تحديث كل 1MB
+				atomic.AddInt64(&server.totalBytes, localBytes)
+				localBytes = 0
+			}
+		}
+		if err != nil {
+			if err != io.EOF {
+				return err
+			}
+			if localBytes > 0 {
+				atomic.AddInt64(&server.totalBytes, localBytes)
+			}
+			break
+		}
+	}
+	return nil
 }
 
-// ??????? ?? ?? ????
+// التعامل مع كل عميل
 func (s *Server) handleClient(client net.Conn) {
 	defer func() {
 		client.Close()
@@ -130,6 +155,8 @@ func (s *Server) handleClient(client net.Conn) {
 		tcpConn.SetNoDelay(true)
 		tcpConn.SetKeepAlive(true)
 		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		tcpConn.SetReadBuffer(BUFFER_SIZE)
+		tcpConn.SetWriteBuffer(BUFFER_SIZE)
 	}
 
 	sshConn, chans, reqs, err := ssh.NewServerConn(client, s.sshConfig)
@@ -175,7 +202,6 @@ func (s *Server) handleClient(client net.Conn) {
 				return
 			}
 
-			// ????? DNS
 			if data.PortToConnect == 53 {
 				data.HostToConnect = "1.1.1.1"
 			}
@@ -193,6 +219,8 @@ func (s *Server) handleClient(client net.Conn) {
 				tcpConn.SetNoDelay(true)
 				tcpConn.SetKeepAlive(true)
 				tcpConn.SetKeepAlivePeriod(30 * time.Second)
+				tcpConn.SetReadBuffer(BUFFER_SIZE)
+				tcpConn.SetWriteBuffer(BUFFER_SIZE)
 			}
 
 			var once sync.Once
@@ -202,19 +230,17 @@ func (s *Server) handleClient(client net.Conn) {
 			}
 
 			go func() {
-				n, _ := copyBuffer(channel, remote, 4<<20)
-				atomic.AddInt64(&s.totalBytes, n)
+				copyBufferOptimized(channel, remote, s)
 				once.Do(closeFunc)
 			}()
 
-			n, _ := copyBuffer(remote, channel, 4<<20)
-			atomic.AddInt64(&s.totalBytes, n)
+			copyBufferOptimized(remote, channel, s)
 			once.Do(closeFunc)
 		}()
 	}
 }
 
-// ????? ?????????? ?? 3 ?????
+// عرض الإحصائيات
 func (s *Server) printStats() {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
