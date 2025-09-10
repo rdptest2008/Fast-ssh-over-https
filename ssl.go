@@ -15,6 +15,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,14 +23,40 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"gopkg.in/natefinch/lumberjack.v2"
 )
 
 const (
-	FIXED_USERNAME = "ahmed"
-	FIXED_PASSWORD = "ahmed"
-	SSH_PORT       = "4443"
-	BUFFER_SIZE    = 256 * 1024 // 256 KB
+	FIXED_USERNAME      = "ahmed"
+	FIXED_PASSWORD      = "ahmed"
+	SSH_PORT            = "4443"
+	BUFFER_SIZE         = 256 * 1024 // 256 KB
+	DEFAULT_IDLE_PERIOD = 10 * time.Minute
+	CLEANUP_INTERVAL    = 1 * time.Minute
+	GC_INTERVAL         = 30 * time.Minute
+	GOROUTINE_CHECK     = 10000
+	LOG_FILENAME        = "server.log"
+	LOG_MAX_SIZE_MB     = 100
+	LOG_MAX_BACKUPS     = 5
+	LOG_MAX_AGE_DAYS    = 30
 )
+
+type Client struct {
+	conn     net.Conn
+	lastSeen atomic.Value // time.Time stored atomically
+}
+
+func (c *Client) SetLastSeen(t time.Time) {
+	c.lastSeen.Store(t)
+}
+
+func (c *Client) LastSeen() time.Time {
+	v := c.lastSeen.Load()
+	if v == nil {
+		return time.Time{}
+	}
+	return v.(time.Time)
+}
 
 type Server struct {
 	sshConfig     *ssh.ServerConfig
@@ -37,9 +64,10 @@ type Server struct {
 	activeClients int32
 	totalBytes    int64
 	stopChan      chan struct{}
+	clients       sync.Map // key: net.Conn, value: *Client
 }
 
-// توليد شهادة TLS
+// توليد شهادة TLS بسيطة (self-signed)
 func generateTLSCert() (tls.Certificate, error) {
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -47,18 +75,18 @@ func generateTLSCert() (tls.Certificate, error) {
 	}
 
 	template := x509.Certificate{
-		SerialNumber: big.NewInt(1),
+		SerialNumber: big.NewInt(time.Now().UnixNano()),
 		Subject: pkix.Name{
 			Organization: []string{"VPN Tunnel"},
 		},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().Add(time.Hour * 24 * 365),
+		NotBefore:             time.Now().Add(-time.Minute),
+		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
 		IsCA:                  true,
 		IPAddresses:           []net.IP{net.IPv4(0, 0, 0, 0), net.IPv4(127, 0, 0, 1)},
-		DNSNames:              []string{"*"},
+		DNSNames:              []string{"localhost"},
 	}
 
 	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
@@ -105,7 +133,6 @@ func newServer() (*Server, error) {
 	server.tlsConfig = &tls.Config{
 		Certificates:             []tls.Certificate{cert},
 		MinVersion:               tls.VersionTLS13,
-		CipherSuites:             nil, // TLS 1.3 يستخدم suite تلقائي أسرع
 		PreferServerCipherSuites: true,
 		NextProtos:               []string{"ssh"},
 	}
@@ -113,20 +140,41 @@ func newServer() (*Server, error) {
 	return server, nil
 }
 
+// إعادة استخدام البفرات مع مسح قبل الإرجاع
+var bufPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, BUFFER_SIZE)
+	},
+}
+
 // نسخ البيانات باستخدام bufio و بافر 256KB مع تجميع atomic
-func copyBufferOptimized(dst io.Writer, src io.Reader, server *Server) error {
-	buf := make([]byte, BUFFER_SIZE)
-	reader := bufio.NewReader(src)
-	writer := bufio.NewWriter(dst)
+func copyBufferOptimized(dst io.Writer, src io.Reader, server *Server, client *Client) error {
+	buf := bufPool.Get().([]byte)
+	// لا نعدل طول الشريحة — نستخدم كامل السعة للقراءة
+	defer func() {
+		// مسح البيانات الحساسة قبل إرجاع البوفر
+		for i := range buf {
+			buf[i] = 0
+		}
+		bufPool.Put(buf)
+	}()
+
+	reader := bufio.NewReaderSize(src, BUFFER_SIZE)
+	writer := bufio.NewWriterSize(dst, BUFFER_SIZE)
 
 	var localBytes int64
 	for {
 		n, err := reader.Read(buf)
 		if n > 0 {
-			written, _ := writer.Write(buf[:n])
-			writer.Flush()
+			written, werr := writer.Write(buf[:n])
+			if werr == nil {
+				_ = writer.Flush()
+			} else {
+				return werr
+			}
 			localBytes += int64(written)
-			if localBytes > 1024*1024 { // تحديث كل 1MB
+			client.SetLastSeen(time.Now())
+			if localBytes >= 1024*1024 { // تحديث كل 1MB
 				atomic.AddInt64(&server.totalBytes, localBytes)
 				localBytes = 0
 			}
@@ -144,23 +192,139 @@ func copyBufferOptimized(dst io.Writer, src io.Reader, server *Server) error {
 	return nil
 }
 
+// تسجيل العميل
+func (s *Server) registerClient(c net.Conn) *Client {
+	client := &Client{conn: c}
+	client.SetLastSeen(time.Now())
+	s.clients.Store(c, client)
+	return client
+}
+
+// إزالة العميل
+func (s *Server) unregisterClient(c net.Conn) {
+	s.clients.Delete(c)
+}
+
+// تنظيف العملاء الغير نشطين بشكل دوري
+func (s *Server) cleanupIdleClients(timeout time.Duration) {
+	ticker := time.NewTicker(CLEANUP_INTERVAL)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.stopChan:
+			return
+		case <-ticker.C:
+			now := time.Now()
+			s.clients.Range(func(key, value interface{}) bool {
+				client := value.(*Client)
+				if now.Sub(client.LastSeen()) > timeout {
+					log.Printf("Cleaning idle client: %v (idle %v)", client.conn.RemoteAddr(), now.Sub(client.LastSeen()))
+					client.conn.Close()
+					s.unregisterClient(client.conn)
+				}
+				return true
+			})
+		}
+	}
+}
+
+// مراقبة عدد goroutines
+func (s *Server) monitorGoroutines(limit int) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.stopChan:
+			return
+		case <-ticker.C:
+			num := runtime.NumGoroutine()
+			if num > limit {
+				log.Printf("WARNING: High goroutine count: %d (possible leak)", num)
+			}
+		}
+	}
+}
+
+// فرض GC دوري
+func (s *Server) periodicGC(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.stopChan:
+			return
+		case <-ticker.C:
+			log.Println("Running forced GC...")
+			runtime.GC()
+		}
+	}
+}
+
+// إغلاق كل العملاء بشكل Graceful
+func (s *Server) shutdownGracefully() {
+	log.Println("Graceful shutdown: closing all active clients...")
+	s.clients.Range(func(key, value interface{}) bool {
+		client := value.(*Client)
+		_ = client.conn.Close()
+		return true
+	})
+}
+
+// فرض Idle timeout لكل اتصال (مستمر)
+func (s *Server) enforceIdleTimeout(c net.Conn, timeout time.Duration) {
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-s.stopChan:
+				return
+			case <-ticker.C:
+				val, ok := s.clients.Load(c)
+				if !ok {
+					return
+				}
+				client := val.(*Client)
+				if time.Since(client.LastSeen()) > timeout {
+					log.Printf("Idle timeout reached for %v, closing", c.RemoteAddr())
+					c.Close()
+					s.unregisterClient(c)
+					return
+				}
+			}
+		}
+	}()
+}
+
 // التعامل مع كل عميل
-func (s *Server) handleClient(client net.Conn) {
+func (s *Server) handleClient(clientConn net.Conn) {
+	// تسجيل العميل مبكرًا لكي نقدر نتعقب الـ idle حتى قبل المصادقة
+	client := s.registerClient(clientConn)
 	defer func() {
-		client.Close()
+		clientConn.Close()
 		atomic.AddInt32(&s.activeClients, -1)
+		s.unregisterClient(clientConn)
 	}()
 
-	if tcpConn, ok := client.(*net.TCPConn); ok {
-		tcpConn.SetNoDelay(true)
-		tcpConn.SetKeepAlive(true)
-		tcpConn.SetKeepAlivePeriod(30 * time.Second)
-		tcpConn.SetReadBuffer(BUFFER_SIZE)
-		tcpConn.SetWriteBuffer(BUFFER_SIZE)
+	// ضبط خصائص TCP لتحسين الأداء
+	if tcpConn, ok := clientConn.(*net.TCPConn); ok {
+		_ = tcpConn.SetNoDelay(true)
+		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		_ = tcpConn.SetReadBuffer(BUFFER_SIZE)
+		_ = tcpConn.SetWriteBuffer(BUFFER_SIZE)
 	}
 
-	sshConn, chans, reqs, err := ssh.NewServerConn(client, s.sshConfig)
+	// تشغيل مراقب Idle خاص بكل اتصال
+	s.enforceIdleTimeout(clientConn, DEFAULT_IDLE_PERIOD)
+
+	sshConn, chans, reqs, err := ssh.NewServerConn(clientConn, s.sshConfig)
 	if err != nil {
+		// خطأ في الـ SSH handshake أو المصادقة
 		return
 	}
 	defer sshConn.Close()
@@ -168,6 +332,9 @@ func (s *Server) handleClient(client net.Conn) {
 	go ssh.DiscardRequests(reqs)
 
 	for newChannel := range chans {
+		if newChannel == nil {
+			continue
+		}
 		if newChannel.ChannelType() != "direct-tcpip" && newChannel.ChannelType() != "session" {
 			newChannel.Reject(ssh.UnknownChannelType, "unknown channel type")
 			continue
@@ -180,16 +347,21 @@ func (s *Server) handleClient(client net.Conn) {
 
 		go func(in <-chan *ssh.Request) {
 			for req := range in {
+				if req == nil {
+					continue
+				}
 				if req.Type == "shell" || req.Type == "exec" || req.Type == "pty-req" {
-					req.Reply(true, nil)
+					_ = req.Reply(true, nil)
 				} else {
-					req.Reply(false, nil)
+					_ = req.Reply(false, nil)
 				}
 			}
 		}(requests)
 
-		go func() {
-			defer channel.Close()
+		// نلتقط نسخة محلية من newChannel لأن المتغير يتغير في الـ loop
+		localChannel := newChannel
+		go func(ch ssh.Channel, nc ssh.NewChannel) {
+			defer ch.Close()
 
 			data := struct {
 				HostToConnect string
@@ -198,10 +370,11 @@ func (s *Server) handleClient(client net.Conn) {
 				OriginPort    uint32
 			}{}
 
-			if err := ssh.Unmarshal(newChannel.ExtraData(), &data); err != nil {
+			if err := ssh.Unmarshal(nc.ExtraData(), &data); err != nil {
 				return
 			}
 
+			// توجيه DNS (مثال: إذا كان المنفذ 53 نوجهه لسيرفر DNS محدد)
 			if data.PortToConnect == 53 {
 				data.HostToConnect = "1.1.1.1"
 			}
@@ -216,31 +389,32 @@ func (s *Server) handleClient(client net.Conn) {
 			defer remote.Close()
 
 			if tcpConn, ok := remote.(*net.TCPConn); ok {
-				tcpConn.SetNoDelay(true)
-				tcpConn.SetKeepAlive(true)
-				tcpConn.SetKeepAlivePeriod(30 * time.Second)
-				tcpConn.SetReadBuffer(BUFFER_SIZE)
-				tcpConn.SetWriteBuffer(BUFFER_SIZE)
+				_ = tcpConn.SetNoDelay(true)
+				_ = tcpConn.SetKeepAlive(true)
+				_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+				_ = tcpConn.SetReadBuffer(BUFFER_SIZE)
+				_ = tcpConn.SetWriteBuffer(BUFFER_SIZE)
 			}
 
 			var once sync.Once
 			closeFunc := func() {
-				channel.Close()
-				remote.Close()
+				_ = ch.Close()
+				_ = remote.Close()
 			}
 
+			// نسخ مزدوج باتجاهين
 			go func() {
-				copyBufferOptimized(channel, remote, s)
+				_ = copyBufferOptimized(ch, remote, s, client)
 				once.Do(closeFunc)
 			}()
 
-			copyBufferOptimized(remote, channel, s)
+			_ = copyBufferOptimized(remote, ch, s, client)
 			once.Do(closeFunc)
-		}()
+		}(channel, localChannel)
 	}
 }
 
-// عرض الإحصائيات
+// عرض الإحصائيات (runtime)
 func (s *Server) printStats() {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
@@ -250,6 +424,9 @@ func (s *Server) printStats() {
 		case <-s.stopChan:
 			return
 		case <-ticker.C:
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+
 			activeClients := atomic.LoadInt32(&s.activeClients)
 			if activeClients < 0 {
 				activeClients = 0
@@ -257,25 +434,45 @@ func (s *Server) printStats() {
 			totalBytes := atomic.LoadInt64(&s.totalBytes)
 			megabytes := float64(totalBytes) / (1024 * 1024)
 
-			fmt.Printf("\r\033[KTotal Data: %.3f MB | Active Clients: %d", megabytes, activeClients)
+			fmt.Printf(
+				"\r\033[KTotal Data: %.3f MB | Active Clients: %d | Goroutines: %d | Heap: %.2f MB",
+				megabytes,
+				activeClients,
+				runtime.NumGoroutine(),
+				float64(m.HeapAlloc)/(1024*1024),
+			)
 		}
 	}
 }
 
 func main() {
-	log.SetFlags(0)
+	// إعدادات Log rotation باستخدام lumberjack
+	log.SetOutput(&lumberjack.Logger{
+		Filename:   LOG_FILENAME,
+		MaxSize:    LOG_MAX_SIZE_MB, // megabytes
+		MaxBackups: LOG_MAX_BACKUPS,
+		MaxAge:     LOG_MAX_AGE_DAYS, // days
+		Compress:   true,
+	})
+	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
+
+	log.Println("Starting VPN Tunnel Server (production mode)...")
 
 	server, err := newServer()
 	if err != nil {
 		log.Fatal(err)
 	}
 
+	// التقاط إشارات النظام لإيقاف Graceful
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigChan
+		log.Println("Signal received, shutting down...")
 		close(server.stopChan)
-		fmt.Println("\nShutting down...")
+		server.shutdownGracefully()
+		// ننتظر لحظات قصيرة لتمكين الإغلاق النظيف
+		time.Sleep(2 * time.Second)
 		os.Exit(0)
 	}()
 
@@ -285,6 +482,7 @@ func main() {
 	}
 	defer listener.Close()
 
+	// احصل على IP محلي للعرض
 	var localIP string
 	addrs, err := net.InterfaceAddrs()
 	if err == nil {
@@ -308,8 +506,13 @@ func main() {
 	fmt.Printf("Password: %s\n", FIXED_PASSWORD)
 	fmt.Println("==============================")
 
+	// شغّل مهام الصيانة الدورية
 	go server.printStats()
+	go server.cleanupIdleClients(DEFAULT_IDLE_PERIOD)
+	go server.periodicGC(GC_INTERVAL)
+	go server.monitorGoroutines(GOROUTINE_CHECK)
 
+	// حلقة قبول الاتصالات
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -317,6 +520,8 @@ func main() {
 			case <-server.stopChan:
 				return
 			default:
+				// تسجيل الخطأ ولكن نستمر بالعمل
+				log.Printf("Accept error: %v", err)
 				continue
 			}
 		}
