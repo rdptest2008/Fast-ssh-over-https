@@ -12,3 +12,4 @@ export PATH=$HOME/go/bin:$HOME/go/bin:$PATH
 go mod init ssl
 
 go get golang.org/x/crypto/ssh
+go get gopkg.in/natefinch/lumberjack.v2
