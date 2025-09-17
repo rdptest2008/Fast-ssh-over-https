@@ -31,9 +31,9 @@ const (
 	BUFFER_SIZE         = 512 * 1024 // 512 KB
 	DEFAULT_IDLE_PERIOD = 10 * time.Minute
 	LOG_FILENAME        = "server.log"
-	LOG_MAX_SIZE_MB     = 100
+	LOG_MAX_SIZE_MB     = 10000
 	LOG_MAX_BACKUPS     = 5
-	LOG_MAX_AGE_DAYS    = 30
+	LOG_MAX_AGE_DAYS    = 10
 )
 
 type ClientStats struct {
@@ -73,7 +73,7 @@ func generateTLSCert() (tls.Certificate, error) {
 	template := x509.Certificate{
 		SerialNumber: big.NewInt(time.Now().UnixNano()),
 		Subject: pkix.Name{
-			Organization: []string{"VPN Tunnel"},
+			Organization: []string{"by ahmed"},
 		},
 		NotBefore:             time.Now().Add(-time.Minute),
 		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
