@@ -343,7 +343,7 @@ func main() {
 	}
 	defer listener.Close()
 
-	fmt.Printf("VPN Tunnel Server Started on port %s\n", SSH_PORT)
+	fmt.Printf("Done %s\n", SSH_PORT)
 	go server.printStats()
 
 	for {
